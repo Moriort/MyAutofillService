@@ -422,7 +422,7 @@ Este proyecto está bajo la Licencia MIT. Ver el archivo `LICENSE` para más det
 
 Para preguntas, sugerencias o soporte técnico:
 
-- 📧 **Email**: [tu-email@ejemplo.com]
+- 📧 **Email**: [mosiah.orellana@digitalstronglocking.com]
 - 🐛 **Issues**: [GitHub Issues](https://github.com/Moriort/MyAutofillService/issues)
 - 📖 **Wiki**: [Documentación completa](https://github.com/Moriort/MyAutofillService/wiki)
 
