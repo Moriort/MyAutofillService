@@ -11,6 +11,7 @@ import android.widget.RemoteViews
 import androidx.annotation.RequiresApi
 import com.example.myautofillservice.data.Credential
 import com.example.myautofillservice.data.CredentialDatabase
+import com.example.myautofillservice.compatibility.BankCompatibilityManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -47,11 +48,7 @@ class MyAutofillService : AutofillService() {
         Log.d(TAG, "  Page ID: ${pageInfo.pageId}")
         Log.d(TAG, "  Title: ${pageInfo.title}")
         
-        // DIAGNÓSTICO: Verificar por qué el dominio no se detecta
-        if (pageInfo.domain.isNullOrBlank()) {
-            Log.w(TAG, "⚠️ DOMAIN DETECTION FAILED - Using fallback system")
-            Log.w(TAG, "This will cause credentials to be saved with page signature instead of real domain")
-        } else {
+        if (!pageInfo.domain.isNullOrBlank()) {
             Log.d(TAG, "✅ Real domain detected successfully: ${pageInfo.domain}")
         }
         
@@ -123,7 +120,8 @@ class MyAutofillService : AutofillService() {
     }
 
     override fun onSaveRequest(request: SaveRequest, callback: SaveCallback) {
-        Log.d(TAG, "🔥 onSaveRequest called - SAVE DIALOG TRIGGERED!")
+        Log.d(TAG, "onSaveRequest called - SAVE DIALOG TRIGGERED!")
+        
         Log.d(TAG, "SaveRequest details:")
         Log.d(TAG, "  - FillContexts: ${request.fillContexts.size}")
         Log.d(TAG, "  - ClientState: ${request.clientState}")
@@ -241,6 +239,13 @@ class MyAutofillService : AutofillService() {
             parseNode(windowNode.rootViewNode, fields)
         }
         
+        // NUEVO: Aplicar mejoras de compatibilidad bancaria
+        val pageInfo = com.example.myautofillservice.utils.PageIdentifier.identifyPage(structure)
+        if (!pageInfo.domain.isNullOrBlank() && BankCompatibilityManager.isChileanBank(pageInfo.domain)) {
+            Log.d(TAG, "🏦 Applying Chilean bank compatibility for: ${pageInfo.domain}")
+            return BankCompatibilityManager.enhanceFieldDetection(pageInfo.domain, fields)
+        }
+        
         return fields
     }
 
@@ -276,106 +281,39 @@ class MyAutofillService : AutofillService() {
     private fun isAutofillableField(node: AssistStructure.ViewNode): Boolean {
         // Verificar si tiene hints explícitos
         if (!node.autofillHints.isNullOrEmpty()) {
-            Log.d(TAG, "Field has explicit hints: ${node.autofillHints?.joinToString()}")
             return true
         }
         
-        // Verificar si es un campo de entrada de texto (Android nativo)
+        // Verificar si es un campo de entrada de texto
         val className = node.className?.toString()?.lowercase(java.util.Locale.getDefault())
         if (className?.contains("edittext") == true || 
-            className?.contains("textinputedittext") == true ||
-            className?.contains("autocompletetextview") == true) {
-            Log.d(TAG, "Field detected by className: $className")
+            className?.contains("textinputedittext") == true) {
             return true
         }
         
-        // Para campos web, verificar información HTML (MEJORADO)
+        // Para campos web, verificar información HTML
         val htmlInfo = node.htmlInfo
         if (htmlInfo != null) {
             val tag = htmlInfo.tag?.lowercase(java.util.Locale.getDefault())
             val type = htmlInfo.attributes?.find { it.first == "type" }?.second?.lowercase(java.util.Locale.getDefault())
-            val name = htmlInfo.attributes?.find { it.first == "name" }?.second?.lowercase(java.util.Locale.getDefault())
-            val id = htmlInfo.attributes?.find { it.first == "id" }?.second?.lowercase(java.util.Locale.getDefault())
-            val placeholder = htmlInfo.attributes?.find { it.first == "placeholder" }?.second?.lowercase(java.util.Locale.getDefault())
             
-            // Campos de entrada HTML (EXPANDIDO)
-            if (tag == "input") {
-                when (type) {
-                    "text", "email", "password", "tel", "number", 
-                    "search", "url", "hidden" -> {
-                        Log.d(TAG, "Field detected by HTML input type: $type")
-                        return true
-                    }
-                    null -> {
-                        // Si no tiene tipo específico, verificar por otros atributos
-                        if (name != null || id != null || placeholder != null) {
-                            Log.d(TAG, "Field detected by HTML input without type but with attributes")
-                            return true
-                        }
-                    }
-                }
-            }
-            
-            // También considerar textarea y select
-            if (tag == "textarea" || tag == "select") {
-                Log.d(TAG, "Field detected by HTML tag: $tag")
+            // Campos de entrada HTML
+            if (tag == "input" && (type == "text" || type == "email" || type == "password" || type == "tel")) {
                 return true
             }
         }
         
-        // Verificar por inputType (MEJORADO)
+        // Verificar por inputType
         val inputType = node.inputType
         if (inputType != 0) {
-            // Tipos de entrada más completos
-            val validInputTypes = listOf(
+            // Tipos de entrada de texto comunes
+            val textInputTypes = listOf(
                 0x00000001, // TYPE_CLASS_TEXT
-                0x00000002, // TYPE_CLASS_NUMBER
-                0x00000003, // TYPE_CLASS_PHONE
                 0x00000021, // TYPE_TEXT_VARIATION_EMAIL_ADDRESS
                 0x00000081, // TYPE_TEXT_VARIATION_PASSWORD
-                0x00000091, // TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-                0x000000b1, // TYPE_TEXT_VARIATION_WEB_PASSWORD
-                0x000000c1, // TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
-                0x00000012, // TYPE_NUMBER_VARIATION_PASSWORD
-                0x00000020, // TYPE_CLASS_DATETIME
-                0x00000004  // TYPE_CLASS_DATETIME
+                0x00000003  // TYPE_CLASS_NUMBER
             )
-            
-            if (validInputTypes.any { (inputType and 0x0000ffff) == it || (inputType and it) != 0 }) {
-                Log.d(TAG, "Field detected by inputType: ${String.format("0x%08x", inputType)}")
-                return true
-            }
-        }
-        
-        // Verificar por características del nodo (NUEVO)
-        if (node.isFocusable && node.isEnabled) {
-            // Si el nodo es enfocable y habilitado, podría ser un campo de entrada
-            val text = node.text?.toString()
-            val hint = node.hint
-            val contentDescription = node.contentDescription?.toString()
-            
-            // Buscar indicadores de que es un campo de entrada
-            val fieldIndicators = listOf(
-                "rut", "usuario", "contraseña", "password", "email", "correo",
-                "login", "user", "pass", "clave", "cedula", "documento",
-                "telefono", "phone", "celular", "movil", "numero", "number"
-            )
-            
-            listOf(text, hint, contentDescription).forEach { str ->
-                str?.lowercase()?.let { lowerStr ->
-                    if (fieldIndicators.any { lowerStr.contains(it) }) {
-                        Log.d(TAG, "Field detected by content indicators: $str")
-                        return true
-                    }
-                }
-            }
-        }
-        
-        // Verificar si está dentro de un formulario o modal (NUEVO)
-        if (isWithinForm(node) || isWithinModal(node)) {
-            // Si está dentro de un formulario o modal y es enfocable, probablemente es un campo
-            if (node.isFocusable && node.isEnabled) {
-                Log.d(TAG, "Field detected within form/modal context")
+            if (textInputTypes.any { (inputType and it) != 0 }) {
                 return true
             }
         }
@@ -390,205 +328,100 @@ class MyAutofillService : AutofillService() {
             return hints[0]
         }
         
-        // Detectar por información HTML (MEJORADO)
+        // Detectar por información HTML
         val htmlInfo = node.htmlInfo
         if (htmlInfo != null) {
             val type = htmlInfo.attributes?.find { it.first == "type" }?.second?.lowercase(java.util.Locale.getDefault())
             val name = htmlInfo.attributes?.find { it.first == "name" }?.second?.lowercase(java.util.Locale.getDefault())
             val id = htmlInfo.attributes?.find { it.first == "id" }?.second?.lowercase(java.util.Locale.getDefault())
-            val placeholder = htmlInfo.attributes?.find { it.first == "placeholder" }?.second?.lowercase(java.util.Locale.getDefault())
             
             // Detectar por tipo HTML
             when (type) {
                 "email" -> return "emailAddress"
                 "password" -> return "password"
                 "tel" -> return "phone"
-                "number" -> {
-                    // Para campos numéricos, verificar si es RUT, cédula, etc.
-                    listOf(name, id, placeholder).forEach { attr ->
-                        attr?.let {
-                            when {
-                                it.contains("rut") || it.contains("cedula") || it.contains("documento") -> return "username"
-                                it.contains("phone") || it.contains("telefono") || it.contains("celular") -> return "phone"
-                            }
-                        }
-                    }
-                    return "username" // Por defecto para campos numéricos
-                }
             }
             
-            // Detectar por nombre, ID o placeholder (EXPANDIDO)
-            listOf(name, id, placeholder).forEach { attr ->
+            // Detectar por nombre o ID
+            listOf(name, id).forEach { attr ->
                 attr?.let {
                     when {
-                        it.contains("email") || it.contains("mail") || it.contains("correo") -> return "emailAddress"
-                        it.contains("user") || it.contains("login") || it.contains("usuario") -> return "username"
-                        it.contains("pass") || it.contains("contraseña") || it.contains("clave") -> return "password"
-                        it.contains("phone") || it.contains("tel") || it.contains("telefono") || it.contains("celular") -> return "phone"
-                        it.contains("rut") || it.contains("cedula") || it.contains("documento") || it.contains("dni") -> return "username"
-                        it.contains("name") || it.contains("nombre") && !it.contains("user") -> return "name"
+                        it.contains("email") || it.contains("mail") -> return "emailAddress"
+                        it.contains("user") || it.contains("login") -> return "username"
+                        it.contains("pass") -> return "password"
+                        it.contains("phone") || it.contains("tel") -> return "phone"
+                        it.contains("name") && !it.contains("user") -> return "name"
                     }
                 }
             }
         }
         
-        // Detectar por inputType (MEJORADO)
+        // Detectar por inputType
         val inputType = node.inputType
         when {
             (inputType and 0x00000021) != 0 -> return "emailAddress" // EMAIL_ADDRESS
             (inputType and 0x00000081) != 0 -> return "password"    // PASSWORD
-            (inputType and 0x000000b1) != 0 -> return "password"    // WEB_PASSWORD
-            (inputType and 0x000000c1) != 0 -> return "emailAddress" // WEB_EMAIL_ADDRESS
-            (inputType and 0x00000002) != 0 -> return "username"    // NUMBER (para RUT, cédulas, etc.)
-            (inputType and 0x00000003) != 0 -> return "phone"       // PHONE
+            (inputType and 0x00000003) != 0 -> return "phone"       // NUMBER (asumimos teléfono)
         }
         
-        // Detectar por texto del campo, hint o descripción (EXPANDIDO)
+        // Detectar por texto del campo o placeholder
         val text = node.text?.toString()?.lowercase(java.util.Locale.getDefault())
         val hint = node.hint?.lowercase(java.util.Locale.getDefault())
-        val contentDescription = node.contentDescription?.toString()?.lowercase(java.util.Locale.getDefault())
         
-        listOf(text, hint, contentDescription).forEach { str ->
+        listOf(text, hint).forEach { str ->
             str?.let {
                 when {
-                    it.contains("email") || it.contains("correo") || it.contains("mail") -> return "emailAddress"
-                    it.contains("user") || it.contains("usuario") || it.contains("login") -> return "username"
-                    it.contains("pass") || it.contains("contraseña") || it.contains("clave") -> return "password"
-                    it.contains("phone") || it.contains("teléfono") || it.contains("telefono") || it.contains("celular") -> return "phone"
-                    it.contains("rut") || it.contains("cedula") || it.contains("documento") || it.contains("dni") -> return "username"
+                    it.contains("email") || it.contains("correo") -> return "emailAddress"
+                    it.contains("user") || it.contains("usuario") -> return "username"
+                    it.contains("pass") || it.contains("contraseña") -> return "password"
+                    it.contains("phone") || it.contains("teléfono") || it.contains("telefono") -> return "phone"
                     it.contains("name") || it.contains("nombre") -> return "name"
                 }
             }
         }
         
-        // Detectar por contexto del campo (NUEVO)
-        val fieldContext = getFieldContext(node)
-        when {
-            fieldContext.contains("login") || fieldContext.contains("signin") -> return "username"
-            fieldContext.contains("password") || fieldContext.contains("contraseña") -> return "password"
-            fieldContext.contains("email") || fieldContext.contains("correo") -> return "emailAddress"
-        }
-        
         // Por defecto, asumir que es un campo de texto genérico
         return "username"
     }
-    
-    private fun getFieldContext(node: AssistStructure.ViewNode): String {
-        // Recopilar texto del contexto alrededor del campo
-        val context = mutableListOf<String>()
-        
-        // Agregar texto de labels cercanos, placeholders, etc.
-        node.text?.toString()?.let { context.add(it) }
-        node.hint?.let { context.add(it) }
-        node.contentDescription?.toString()?.let { context.add(it) }
-        
-        // TODO: Agregar lógica para buscar en nodos hermanos y padres
-        
-        return context.joinToString(" ").lowercase(java.util.Locale.getDefault())
-    }
-    
-    private fun isWithinForm(node: AssistStructure.ViewNode): Boolean {
-        // Verificar si el nodo está dentro de un formulario
-        var parent = node
-        var depth = 0
-        
-        // Buscar hasta 10 niveles hacia arriba
-        while (depth < 10) {
-            val className = parent.className?.toString()?.lowercase()
-            val idEntry = parent.idEntry?.lowercase()
-            
-            // Indicadores de formulario
-            if (className?.contains("form") == true ||
-                idEntry?.contains("form") == true ||
-                idEntry?.contains("login") == true ||
-                idEntry?.contains("signin") == true ||
-                idEntry?.contains("register") == true ||
-                idEntry?.contains("signup") == true) {
-                return true
-            }
-            
-            // Verificar HTML
-            parent.htmlInfo?.let { htmlInfo ->
-                if (htmlInfo.tag?.lowercase() == "form") {
-                    return true
-                }
-            }
-            
-            depth++
-            // TODO: Implementar navegación hacia el padre
-            break // Por ahora, solo verificar el nodo actual
-        }
-        
-        return false
-    }
-    
-    private fun isWithinModal(node: AssistStructure.ViewNode): Boolean {
-        // Verificar si el nodo está dentro de un modal o overlay
-        var parent = node
-        var depth = 0
-        
-        // Buscar hasta 10 niveles hacia arriba
-        while (depth < 10) {
-            val className = parent.className?.toString()?.lowercase()
-            val idEntry = parent.idEntry?.lowercase()
-            
-            // Indicadores de modal/overlay
-            if (className?.contains("modal") == true ||
-                className?.contains("dialog") == true ||
-                className?.contains("overlay") == true ||
-                className?.contains("popup") == true ||
-                idEntry?.contains("modal") == true ||
-                idEntry?.contains("dialog") == true ||
-                idEntry?.contains("overlay") == true ||
-                idEntry?.contains("popup") == true) {
-                return true
-            }
-            
-            depth++
-            // TODO: Implementar navegación hacia el padre
-            break // Por ahora, solo verificar el nodo actual
-        }
-        
-        return false
-    }
 
-    private fun createFillResponse(fields: List<AutofillField>): FillResponse {
-        val responseBuilder = FillResponse.Builder()
-        
-        // Crear datasets con datos de ejemplo
-        val datasets = createSampleDatasets(fields)
-        datasets.forEach { dataset ->
-            responseBuilder.addDataset(dataset)
-        }
-        
-        return responseBuilder.build()
-    }
-
+    // NUEVO: Función mejorada para crear datasets específicos por tipo de sitio
     private fun createSampleDatasets(fields: List<AutofillField>): List<Dataset> {
         val datasets = mutableListOf<Dataset>()
         
-        // Solo crear datasets si hay campos válidos
         if (fields.isEmpty()) {
             Log.w(TAG, "No fields available for sample datasets")
             return datasets
         }
         
-        // Dataset de ejemplo 1
+        // Detectar si hay campos de banco (hints "off" o "new-password")
+        val hasBankFields = fields.any { it.hint == "off" || it.hint == "new-password" }
+        
+        // Dataset 1
         val dataset1Builder = Dataset.Builder()
         val presentation1 = RemoteViews(packageName, android.R.layout.simple_list_item_1)
-        presentation1.setTextViewText(android.R.id.text1, "Usuario de prueba 1")
         
         var hasValidFields1 = false
         fields.forEach { field ->
-            val value = when (field.hint) {
-                "username", "emailAddress" -> "usuario1@ejemplo.com"
-                "password" -> "password123"
-                "name" -> "Juan Pérez"
-                "phone" -> "+1234567890"
-                else -> ""
+            val (title, value) = if (hasBankFields) {
+                "RUT de Ejemplo 1" to when (field.hint) {
+                    "username", "emailAddress" -> "12345678-9"
+                    "password" -> "MiClave123"
+                    "off" -> "12345678-9"
+                    "new-password" -> "MiClave123"
+                    else -> ""
+                }
+            } else {
+                "Usuario de prueba 1" to when (field.hint) {
+                    "username", "emailAddress" -> "usuario1@ejemplo.com"
+                    "password" -> "password123"
+                    "name" -> "Juan Pérez"
+                    "phone" -> "+1234567890"
+                    else -> ""
+                }
             }
             
             if (value.isNotEmpty()) {
+                presentation1.setTextViewText(android.R.id.text1, title)
                 dataset1Builder.setValue(
                     field.autofillId,
                     AutofillValue.forText(value),
@@ -600,25 +433,35 @@ class MyAutofillService : AutofillService() {
         
         if (hasValidFields1) {
             datasets.add(dataset1Builder.build())
-            Log.d(TAG, "Added sample dataset 1")
+            Log.d(TAG, if (hasBankFields) "Added Chilean bank dataset 1" else "Added standard dataset 1")
         }
         
-        // Dataset de ejemplo 2
+        // Dataset 2
         val dataset2Builder = Dataset.Builder()
         val presentation2 = RemoteViews(packageName, android.R.layout.simple_list_item_1)
-        presentation2.setTextViewText(android.R.id.text1, "Usuario de prueba 2")
         
         var hasValidFields2 = false
         fields.forEach { field ->
-            val value = when (field.hint) {
-                "username", "emailAddress" -> "usuario2@ejemplo.com"
-                "password" -> "mypassword456"
-                "name" -> "María García"
-                "phone" -> "+0987654321"
-                else -> ""
+            val (title, value) = if (hasBankFields) {
+                "RUT de Ejemplo 2" to when (field.hint) {
+                    "username", "emailAddress" -> "98765432-1"
+                    "password" -> "ClaveSegura456"
+                    "off" -> "98765432-1"
+                    "new-password" -> "ClaveSegura456"
+                    else -> ""
+                }
+            } else {
+                "Usuario de prueba 2" to when (field.hint) {
+                    "username", "emailAddress" -> "usuario2@ejemplo.com"
+                    "password" -> "mypassword456"
+                    "name" -> "María García"
+                    "phone" -> "+0987654321"
+                    else -> ""
+                }
             }
             
             if (value.isNotEmpty()) {
+                presentation2.setTextViewText(android.R.id.text1, title)
                 dataset2Builder.setValue(
                     field.autofillId,
                     AutofillValue.forText(value),
@@ -630,30 +473,10 @@ class MyAutofillService : AutofillService() {
         
         if (hasValidFields2) {
             datasets.add(dataset2Builder.build())
-            Log.d(TAG, "Added sample dataset 2")
+            Log.d(TAG, if (hasBankFields) "Added Chilean bank dataset 2" else "Added standard dataset 2")
         }
         
         return datasets
-    }
-
-    private fun logStructure(structure: AssistStructure) {
-        Log.d(TAG, "=== Structure Analysis ===")
-        for (i in 0 until structure.windowNodeCount) {
-            val windowNode = structure.getWindowNodeAt(i)
-            logNode(windowNode.rootViewNode, 0)
-        }
-    }
-
-    private fun logNode(node: AssistStructure.ViewNode, depth: Int) {
-        val indent = "  ".repeat(depth)
-        Log.d(TAG, "${indent}Node: ${node.className}")
-        Log.d(TAG, "${indent}  Text: ${node.text}")
-        Log.d(TAG, "${indent}  Hints: ${node.autofillHints?.joinToString()}")
-        Log.d(TAG, "${indent}  AutofillId: ${node.autofillId}")
-        
-        for (i in 0 until node.childCount) {
-            logNode(node.getChildAt(i), depth + 1)
-        }
     }
 
     private fun createFillResponseWithCredentials(
@@ -730,92 +553,50 @@ class MyAutofillService : AutofillService() {
         Log.d(TAG, "=== Configuring SaveInfo ===")
         Log.d(TAG, "Total fields available: ${fields.size}")
         
-        // Log todos los campos para debugging
         fields.forEachIndexed { index, field ->
             Log.d(TAG, "Field $index: hint='${field.hint}', text='${field.text}', id=${field.autofillId}")
         }
         
-        // Identificar campos de usuario y contraseña con criterios más amplios
-        val usernameFields = fields.filter { field ->
-            field.hint == "username" || 
-            field.hint == "emailAddress" || 
-            field.hint == "name" ||
-            field.hint == "phone" ||
-            field.hint.contains("user", ignoreCase = true) ||
-            field.hint.contains("email", ignoreCase = true)
+        // Identificar campos de usuario y contraseña
+        val usernameFields = fields.filter { 
+            it.hint == "username" || it.hint == "emailAddress" 
         }.map { it.autofillId }
         
-        val passwordFields = fields.filter { field ->
-            field.hint == "password" ||
-            field.hint.contains("pass", ignoreCase = true) ||
-            field.hint.contains("clave", ignoreCase = true)
+        val passwordFields = fields.filter { 
+            it.hint == "password" 
         }.map { it.autofillId }
         
         Log.d(TAG, "Username fields found: ${usernameFields.size}")
         Log.d(TAG, "Password fields found: ${passwordFields.size}")
         
-        // SIMPLIFICADO: Solo usar campos de contraseña para SaveInfo
-        val saveFields = if (passwordFields.isNotEmpty()) {
+        // Configurar SaveInfo con todos los campos relevantes
+        val allRelevantFields = if (passwordFields.isNotEmpty()) {
             Log.d(TAG, "Using password fields for SaveInfo")
             passwordFields.toTypedArray()
-        } else if (fields.isNotEmpty()) {
-            Log.d(TAG, "Using all fields as fallback for SaveInfo")
-            fields.map { it.autofillId }.toTypedArray()
+        } else if (usernameFields.isNotEmpty()) {
+            Log.d(TAG, "Using username fields for SaveInfo")
+            usernameFields.toTypedArray()
         } else {
-            Log.w(TAG, "No fields available for SaveInfo")
-            emptyArray()
+            // Fallback: usar todos los campos detectados
+            Log.d(TAG, "No specific username/password fields found, using all ${fields.size} fields")
+            fields.map { it.autofillId }.toTypedArray()
         }
         
-        if (saveFields.isNotEmpty()) {
-            try {
-                // Determinar el tipo de datos a guardar
-                val saveDataType = when {
-                    passwordFields.isNotEmpty() && usernameFields.isNotEmpty() -> 
-                        SaveInfo.SAVE_DATA_TYPE_USERNAME or SaveInfo.SAVE_DATA_TYPE_PASSWORD
-                    passwordFields.isNotEmpty() -> 
-                        SaveInfo.SAVE_DATA_TYPE_PASSWORD
-                    usernameFields.isNotEmpty() -> 
-                        SaveInfo.SAVE_DATA_TYPE_USERNAME
-                    else -> 
-                        SaveInfo.SAVE_DATA_TYPE_GENERIC
-                }
-                
-                val saveInfoBuilder = SaveInfo.Builder(saveDataType, saveFields)
-                
-                // Configurar flags más simples para que funcione
-                saveInfoBuilder.setFlags(SaveInfo.FLAG_SAVE_ON_ALL_VIEWS_INVISIBLE)
-                
-                // Configurar descripción para el diálogo (opcional pero útil)
-                try {
-                    saveInfoBuilder.setDescription("Guardar credenciales para este sitio")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Could not set SaveInfo description", e)
-                }
-                
-                // Configurar SaveInfo
-                val saveInfo = saveInfoBuilder.build()
-                responseBuilder.setSaveInfo(saveInfo)
-                
-                Log.d(TAG, "✅ SaveInfo configured successfully!")
-                Log.d(TAG, "  - Fields: ${saveFields.size}")
-                Log.d(TAG, "  - Data type: $saveDataType")
-                Log.d(TAG, "  - Flags: ${SaveInfo.FLAG_SAVE_ON_ALL_VIEWS_INVISIBLE}")
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error configuring SaveInfo", e)
-                
-                // Fallback: configuración mínima
-                try {
-                    val minimalSaveInfo = SaveInfo.Builder(
-                        SaveInfo.SAVE_DATA_TYPE_GENERIC,
-                        saveFields
-                    ).build()
-                    responseBuilder.setSaveInfo(minimalSaveInfo)
-                    Log.d(TAG, "✅ Fallback SaveInfo configured")
-                } catch (fallbackError: Exception) {
-                    Log.e(TAG, "❌ Even fallback SaveInfo failed", fallbackError)
-                }
-            }
+        if (allRelevantFields.isNotEmpty()) {
+            val saveInfoBuilder = SaveInfo.Builder(
+                SaveInfo.SAVE_DATA_TYPE_USERNAME or SaveInfo.SAVE_DATA_TYPE_PASSWORD,
+                allRelevantFields
+            )
+            
+            // Configurar para que SIEMPRE pregunte si quiere guardar
+            saveInfoBuilder.setFlags(SaveInfo.FLAG_SAVE_ON_ALL_VIEWS_INVISIBLE)
+            
+            responseBuilder.setSaveInfo(saveInfoBuilder.build())
+            
+            Log.d(TAG, "✅ SaveInfo configured successfully!")
+            Log.d(TAG, "  - Fields: ${allRelevantFields.size}")
+            Log.d(TAG, "  - Data type: ${SaveInfo.SAVE_DATA_TYPE_USERNAME or SaveInfo.SAVE_DATA_TYPE_PASSWORD}")
+            Log.d(TAG, "  - Flags: ${SaveInfo.FLAG_SAVE_ON_ALL_VIEWS_INVISIBLE}")
         } else {
             Log.w(TAG, "❌ No fields available for SaveInfo configuration")
         }
@@ -823,6 +604,7 @@ class MyAutofillService : AutofillService() {
         Log.d(TAG, "=== SaveInfo configuration complete ===")
     }
     
+    // NUEVO: Función mejorada para extraer credenciales con soporte para bancos
     private fun extractCredentialsFromStructure(structure: AssistStructure): List<Pair<String, String>> {
         val credentials = mutableListOf<Pair<String, String>>()
         val fieldValues = mutableMapOf<String, String>()
@@ -835,20 +617,39 @@ class MyAutofillService : AutofillService() {
         
         Log.d(TAG, "Extracted field values: $fieldValues")
         
-        // Buscar combinaciones de usuario/email y contraseña
-        val userFields = fieldValues.filter { (key, _) ->
-            key.contains("username") || key.contains("email") || key.contains("user") || key.contains("login")
-        }
+        // NUEVO: Detectar si es un banco chileno para manejo especial
+        val pageInfo = com.example.myautofillservice.utils.PageIdentifier.identifyPage(structure)
+        val isChileanBank = !pageInfo.domain.isNullOrBlank() && BankCompatibilityManager.isChileanBank(pageInfo.domain)
         
-        val passwordFields = fieldValues.filter { (key, _) ->
-            key.contains("password") || key.contains("pass")
-        }
-        
-        // Crear pares de credenciales
-        userFields.forEach { (_, username) ->
-            passwordFields.forEach { (_, password) ->
-                if (username.isNotBlank() && password.isNotBlank()) {
-                    credentials.add(Pair(username, password))
+        if (isChileanBank) {
+            Log.d(TAG, "🏦 Processing Chilean bank credentials extraction")
+            
+            // Para bancos chilenos: buscar campos específicos
+            val rutValue = fieldValues["off"] ?: fieldValues["username"] ?: ""
+            val claveValue = fieldValues["new-password"] ?: fieldValues["password"] ?: ""
+            
+            if (rutValue.isNotBlank() && claveValue.isNotBlank()) {
+                Log.d(TAG, "🏦 Found Chilean bank credentials: RUT=$rutValue, Clave=***")
+                credentials.add(Pair(rutValue, claveValue))
+            }
+        } else {
+            Log.d(TAG, "🌐 Processing standard credentials extraction")
+            
+            // Para sitios normales: buscar combinaciones estándar
+            val userFields = fieldValues.filter { (key, _) ->
+                key.contains("username") || key.contains("email") || key.contains("user") || key.contains("login")
+            }
+            
+            val passwordFields = fieldValues.filter { (key, _) ->
+                key.contains("password") || key.contains("pass")
+            }
+            
+            // Crear pares de credenciales
+            userFields.forEach { (_, username) ->
+                passwordFields.forEach { (_, password) ->
+                    if (username.isNotBlank() && password.isNotBlank()) {
+                        credentials.add(Pair(username, password))
+                    }
                 }
             }
         }
@@ -861,61 +662,11 @@ class MyAutofillService : AutofillService() {
         
         if (autofillId != null && isAutofillableField(node)) {
             val fieldType = detectFieldType(node)
+            val value = node.autofillValue?.textValue?.toString() ?: ""
             
-            // Intentar extraer el valor de múltiples fuentes
-            var value = ""
-            
-            // 1. Primero intentar autofillValue (más confiable)
-            node.autofillValue?.let { autofillValue ->
-                when {
-                    autofillValue.isText -> value = autofillValue.textValue?.toString() ?: ""
-                    autofillValue.isList -> {
-                        // Para campos de lista/select
-                        val listValue = autofillValue.listValue
-                        if (listValue >= 0) {
-                            value = listValue.toString()
-                        }
-                    }
-                }
-            }
-            
-            // 2. Si no hay autofillValue, intentar con el texto del nodo
-            if (value.isBlank()) {
-                node.text?.toString()?.let { nodeText ->
-                    // Solo usar el texto si parece ser un valor ingresado (no un placeholder)
-                    if (nodeText.isNotBlank() && !isPlaceholderText(nodeText, node)) {
-                        value = nodeText
-                        Log.d(TAG, "Using node text as value for $fieldType: $value")
-                    }
-                }
-            }
-            
-            // 3. Para campos de contraseña, a veces el valor está oculto
-            if (value.isBlank() && fieldType == "password") {
-                // Intentar detectar si hay una contraseña ingresada
-                val hint = node.hint
-                val contentDesc = node.contentDescription?.toString()
-                
-                // Si el hint cambió o hay indicadores de que se ingresó algo
-                if (hint != null && hint.isNotBlank() && !hint.equals("password", true) && 
-                    !hint.equals("contraseña", true) && !hint.equals("clave", true)) {
-                    // El hint podría contener el valor (en algunos casos)
-                    value = hint
-                    Log.d(TAG, "Using hint as password value for $fieldType")
-                } else if (node.isFocused || hasPasswordIndicators(node)) {
-                    // Si el campo está enfocado o tiene indicadores de contraseña ingresada
-                    value = "***" // Placeholder para indicar que hay una contraseña
-                    Log.d(TAG, "Detected password field with hidden value for $fieldType")
-                }
-            }
-            
-            if (value.isNotBlank() && value != "***") {
+            if (value.isNotBlank()) {
                 fieldValues[fieldType] = value
                 Log.d(TAG, "Extracted value for $fieldType: $value")
-            } else if (value == "***") {
-                // Para contraseñas ocultas, necesitamos una estrategia diferente
-                Log.d(TAG, "Password field detected but value is hidden for $fieldType")
-                // TODO: Implementar extracción de contraseñas ocultas si es necesario
             } else {
                 Log.d(TAG, "No value found for field $fieldType")
             }
@@ -925,51 +676,6 @@ class MyAutofillService : AutofillService() {
         for (i in 0 until node.childCount) {
             extractFieldValues(node.getChildAt(i), fieldValues)
         }
-    }
-    
-    private fun isPlaceholderText(text: String, node: AssistStructure.ViewNode): Boolean {
-        val lowerText = text.lowercase()
-        
-        // Textos que probablemente son placeholders
-        val placeholderIndicators = listOf(
-            "ingrese", "enter", "escriba", "digite", "ejemplo", "example",
-            "usuario", "username", "email", "correo", "contraseña", "password",
-            "clave", "rut", "cedula", "documento", "telefono", "phone"
-        )
-        
-        // Si el texto es muy corto o coincide con placeholders comunes
-        if (text.length < 3 || placeholderIndicators.any { lowerText.contains(it) }) {
-            return true
-        }
-        
-        // Si coincide con el hint del nodo, probablemente es un placeholder
-        node.hint?.let { hint ->
-            if (text.equals(hint, ignoreCase = true)) {
-                return true
-            }
-        }
-        
-        return false
-    }
-    
-    private fun hasPasswordIndicators(node: AssistStructure.ViewNode): Boolean {
-        // Verificar si hay indicadores de que se ingresó una contraseña
-        val inputType = node.inputType
-        
-        // Si es un campo de contraseña y está habilitado/enfocable
-        if ((inputType and 0x00000081) != 0 || (inputType and 0x000000b1) != 0) {
-            return node.isEnabled && node.isFocusable
-        }
-        
-        // Verificar por HTML
-        node.htmlInfo?.let { htmlInfo ->
-            val type = htmlInfo.attributes?.find { it.first == "type" }?.second?.lowercase()
-            if (type == "password") {
-                return true
-            }
-        }
-        
-        return false
     }
 
     private fun createMinimalDataset(fields: List<AutofillField>): Dataset? {
